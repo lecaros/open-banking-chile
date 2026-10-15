@@ -5,6 +5,8 @@ import {
   normalizeSantanderCheckingApiMovements,
   normalizeSantanderUnbilledApiMovements,
   normalizeSantanderBilledApiMovements,
+  parseSantanderMovementSlides,
+  selectSantanderCheckingMovements,
 } from "./santander.js";
 
 // ─── isSaldoInicial ──────────────────────────────────────────────
@@ -339,5 +341,98 @@ describe("normalizeSantanderBilledApiMovements", () => {
   it("skips captures with missing nested path", () => {
     expect(normalizeSantanderBilledApiMovements([{}])).toEqual([]);
     expect(normalizeSantanderBilledApiMovements([{ DATA: {} }])).toEqual([]);
+  });
+});
+
+// ─── parseSantanderMovementSlides ────────────────────────────────
+
+describe("parseSantanderMovementSlides", () => {
+  it("keeps only checking accounts of a Banca Privada carousel, preserving slide indexes", () => {
+    const accounts = parseSantanderMovementSlides([
+      { index: 0, text: "Cuenta Corriente 9 999 99 99999 9 $9.999.999" },
+      { index: 1, text: "Línea de Crédito 9 999 99 99999 9 $9.999.999" },
+      { index: 2, text: "Cuenta Corriente Dólar 9 999 99 99999 9 USD 99.999,99" },
+    ]);
+    expect(accounts).toEqual([
+      { index: 0, label: "Cuenta Corriente 9 999 99 99999 9", currency: "CLP" },
+      { index: 2, label: "Cuenta Corriente 9 999 99 99999 9", currency: "USD" },
+    ]);
+  });
+
+  it("parses a retail Cuenta Vista as CLP", () => {
+    expect(parseSantanderMovementSlides([{ index: 0, text: "Cuenta Vista 0 000 12 34567 8" }])).toEqual([
+      { index: 0, label: "Cuenta Vista 0 000 12 34567 8", currency: "CLP" },
+    ]);
+  });
+
+  it("skips slides with empty text", () => {
+    expect(parseSantanderMovementSlides([{ index: 0, text: "" }, { index: 1, text: "   " }])).toEqual([]);
+  });
+
+  it("falls back to #N when the slide has no account number", () => {
+    expect(parseSantanderMovementSlides([{ index: 2, text: "Cuenta Corriente" }])).toEqual([
+      { index: 2, label: "Cuenta Corriente #3", currency: "CLP" },
+    ]);
+  });
+
+  it("skips slides that are not checking accounts", () => {
+    expect(
+      parseSantanderMovementSlides([
+        { index: 0, text: "Tarjeta de Crédito 1 234 5678" },
+        { index: 1, text: "Línea de Crédito 9 999 99 99999 9 $1.000" },
+      ]),
+    ).toEqual([]);
+  });
+
+  it("detects USD from US$ marker", () => {
+    expect(parseSantanderMovementSlides([{ index: 0, text: "Cuenta Corriente 1 234 56 78901 2 US$ 10,00" }])[0]?.currency).toBe("USD");
+  });
+});
+
+// ─── selectSantanderCheckingMovements ────────────────────────────
+
+describe("selectSantanderCheckingMovements", () => {
+  it("parses movements from a capture without needing the HTML fallback", () => {
+    const result = selectSantanderCheckingMovements([
+      {
+        movements: [
+          { transactionDate: "2026-03-19", movementAmount: "00000000090999-", chargePaymentFlag: "H", observation: "Compra", expandedCode: "" },
+          { transactionDate: "2026-03-20", movementAmount: "00000000100000", chargePaymentFlag: "D", observation: "Cargo", expandedCode: "" },
+          { transactionDate: "2026-03-21", movementAmount: "00000000050000", chargePaymentFlag: "H", observation: "Abono", expandedCode: "" },
+        ],
+      },
+    ]);
+    expect(result.needsHtmlFallback).toBe(false);
+    expect(result.movements.map((m) => m.amount)).toEqual([-909.99, -1000, 500]);
+  });
+
+  it("trusts a capture with no movements key (credit line) and does not fall back", () => {
+    const result = selectSantanderCheckingMovements([
+      { additionalInfo: [{ key: "code-ms", value: "00" }, { key: "message-ms", value: "" }] },
+    ]);
+    expect(result).toEqual({ movements: [], needsHtmlFallback: false });
+  });
+
+  it("trusts a capture with an empty movements array", () => {
+    expect(selectSantanderCheckingMovements([{ movements: [] }])).toEqual({ movements: [], needsHtmlFallback: false });
+  });
+
+  it("requests the HTML fallback only when no capture arrived", () => {
+    expect(selectSantanderCheckingMovements([])).toEqual({ movements: [], needsHtmlFallback: true });
+  });
+
+  it("does not throw on malformed captures and entries", () => {
+    const result = selectSantanderCheckingMovements([
+      null,
+      { movements: "nope" },
+      {
+        movements: [
+          null,
+          { transactionDate: "2026-03-19", movementAmount: "000", chargePaymentFlag: "D", observation: "x", expandedCode: "" },
+          { transactionDate: "2026-03-19", movementAmount: 123, chargePaymentFlag: "D", observation: "x", expandedCode: "" },
+        ],
+      },
+    ]);
+    expect(result).toEqual({ movements: [], needsHtmlFallback: false });
   });
 });

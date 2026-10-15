@@ -44,6 +44,7 @@ export function normalizeSantanderCheckingApiMovements(captures: unknown[]): Ban
     const list = obj?.movements;
     if (!Array.isArray(list)) continue;
     for (const m of list) {
+      if (!m || typeof m.movementAmount !== "string") continue;
       const digits = m.movementAmount.replace(/[^0-9]/g, "");
       const raw = parseInt(digits, 10);
       if (!raw || isNaN(raw)) continue;
@@ -66,6 +67,20 @@ export function normalizeSantanderCheckingApiMovements(captures: unknown[]): Ban
     }
   }
   return movements;
+}
+
+/**
+ * Decide qué hacer con las capturas de la API de cuentas corrientes. Solo se recurre al
+ * HTML si no llegó ninguna captura: si la API respondió (aun sin `movements`, como en la
+ * Línea de Crédito de Banca Privada) la tabla HTML puede seguir mostrando la cuenta
+ * anterior, así que importarla duplicaría movimientos bajo la cuenta equivocada.
+ */
+export function selectSantanderCheckingMovements(captures: unknown[]): {
+  movements: BankMovement[];
+  needsHtmlFallback: boolean;
+} {
+  if (captures.length === 0) return { movements: [], needsHtmlFallback: true };
+  return { movements: normalizeSantanderCheckingApiMovements(captures), needsHtmlFallback: false };
 }
 
 interface SantanderCcApiMovement {
@@ -237,32 +252,40 @@ export async function collectCreditCardTab(
 
 // ─── Santander-specific helpers ──────────────────────────────────────
 
-type MovementAccount = { index: number; label: string; currency: "CLP" | "USD" };
+export type MovementAccount = { index: number; label: string; currency: "CLP" | "USD" };
 
 async function getLoginFrame(page: Page): Promise<Frame | null> {
   const handle = await page.$("iframe#login-frame");
   return handle ? await handle.contentFrame() : null;
 }
 
+/** Clasifica los slides del carrusel: solo Cuenta Corriente / Cuenta Vista tienen movimientos. */
+export function parseSantanderMovementSlides(slides: { index: number; text: string }[]): MovementAccount[] {
+  const out: MovementAccount[] = [];
+  for (const slide of slides) {
+    const text = slide.text.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const typeMatch = text.match(/Cuenta\s+(Corriente|Vista)/i);
+    if (!typeMatch) continue; // ej. Línea de Crédito: la API no devuelve movimientos
+    const numberMatch = text.match(/\d(?:[\s.]\d+){3,}/);
+    const type = `Cuenta ${typeMatch[1]}`;
+    const number = numberMatch ? numberMatch[0].replace(/\s+/g, " ").trim() : `#${slide.index + 1}`;
+    // Santander muestra "Cuenta Corriente Dólar" para la cuenta en USD — no hay otro
+    // indicador estructurado (la API de movimientos tampoco trae moneda ni cuenta).
+    const currency: "CLP" | "USD" = /US\$|USD|d[oó]lar/i.test(text) ? "USD" : "CLP";
+    out.push({ index: slide.index, label: `${type} ${number}`.trim(), currency });
+  }
+  return out;
+}
+
 async function listMovementAccounts(page: Page): Promise<MovementAccount[]> {
-  return await page.evaluate(() => {
-    const slides = Array.from(document.querySelectorAll("#tabs-carousel-movs .swiper-slide"));
-    const out: Array<{ index: number; label: string; currency: "CLP" | "USD" }> = [];
-    for (let i = 0; i < slides.length; i++) {
-      const slide = slides[i] as HTMLElement;
-      const text = slide.innerText?.replace(/\s+/g, " ").trim() || "";
-      if (!text) continue;
-      const typeMatch = text.match(/Cuenta\s+(Corriente|Vista)/i);
-      const numberMatch = text.match(/\d(?:[\s.]\d+){3,}/);
-      const type = typeMatch ? `Cuenta ${typeMatch[1]}` : "Cuenta";
-      const number = numberMatch ? numberMatch[0].replace(/\s+/g, " ").trim() : `#${i + 1}`;
-      // Santander muestra "Cuenta Corriente Dólar" para la cuenta en USD — no hay otro
-      // indicador estructurado (la API de movimientos tampoco trae moneda ni cuenta).
-      const currency: "CLP" | "USD" = /US\$|USD|d[oó]lar/i.test(text) ? "USD" : "CLP";
-      out.push({ index: i, label: `${type} ${number}`.trim(), currency });
-    }
-    return out;
-  });
+  const slides = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("#tabs-carousel-movs .swiper-slide")).map((slide, index) => ({
+      index,
+      text: (slide as HTMLElement).innerText || "",
+    })),
+  );
+  return parseSantanderMovementSlides(slides);
 }
 
 async function selectMovementAccount(page: Page, index: number): Promise<boolean> {
@@ -271,6 +294,12 @@ async function selectMovementAccount(page: Page, index: number): Promise<boolean
       `#tabs-carousel-movs [aria-label='Go to slide ${targetIndex + 1}']`,
     ) as HTMLElement | null;
     if (byAria) { byAria.click(); return true; }
+
+    // Banca Privada usa etiquetas "Seleccionar cuenta N de M" en vez de "Go to slide N"
+    const bySelect = document.querySelector(
+      `#tabs-carousel-movs [aria-label^='Seleccionar cuenta ${targetIndex + 1} ']`,
+    ) as HTMLElement | null;
+    if (bySelect) { bySelect.click(); return true; }
 
     const dots = Array.from(document.querySelectorAll("#tabs-carousel-movs .swiper-pagination-bullet"));
     if (dots[targetIndex]) { (dots[targetIndex] as HTMLElement).click(); return true; }
@@ -511,14 +540,14 @@ async function scrapeSantander(
 
   if (accounts.length <= 1) {
     const currency = accounts[0]?.currency ?? "CLP";
+    const selection = selectSantanderCheckingMovements(initialCaptures);
     if (initialCaptures.length > 0) {
       debugLog.push(`  Checking API: ${initialCaptures.length} response(s) captured`);
-      const apiMovements = normalizeSantanderCheckingApiMovements(initialCaptures);
-      debugLog.push(`  Checking API movements: ${apiMovements.length}`);
-      for (const m of apiMovements) m.currency = currency;
-      movements.push(...apiMovements);
+      debugLog.push(`  Checking API movements: ${selection.movements.length}`);
+      for (const m of selection.movements) m.currency = currency;
+      movements.push(...selection.movements);
     }
-    if (movements.length === 0) {
+    if (selection.needsHtmlFallback) {
       debugLog.push("  Checking API: no data, falling back to HTML extraction");
       const domMovements = await paginateAndExtract(page, extractAccountMovements, debugLog);
       for (const m of domMovements) m.currency = currency;
@@ -546,17 +575,19 @@ async function scrapeSantander(
         acctCaptures = await interceptor.waitFor("santander-checking", 8_000);
       }
 
-      const apiMovements = acctCaptures.length > 0 ? normalizeSantanderCheckingApiMovements(acctCaptures) : [];
+      const selection = selectSantanderCheckingMovements(acctCaptures);
 
-      if (apiMovements.length > 0) {
-        for (const m of apiMovements) m.currency = account.currency;
-        movements.push(...apiMovements);
-        debugLog.push(`  ${account.label} [${account.currency}] (API): ${apiMovements.length} movement(s)`);
+      if (!selection.needsHtmlFallback) {
+        for (const m of selection.movements) m.currency = account.currency;
+        movements.push(...selection.movements);
+        if (selection.movements.length > 0) {
+          debugLog.push(`  ${account.label} [${account.currency}] (API): ${selection.movements.length} movement(s)`);
+        } else {
+          debugLog.push(`  ${account.label}: API answered with 0 movements`);
+        }
       } else if (onAccountPage) {
-        // Si esta cuenta no expone movimientos por esta API (ej. Línea de Crédito, que no
-        // siempre es un producto "current-account" — o devuelve una respuesta con 0
-        // movimientos en un formato distinto), volvemos al scraping de la tabla HTML. Ya
-        // estamos en la página de esta cuenta, no hace falta volver a cambiar.
+        // Si la API no respondió para esta cuenta, volvemos al scraping de la tabla HTML.
+        // Ya estamos en la página de esta cuenta, no hace falta volver a cambiar.
         const acctMovements = await paginateAndExtract(page, extractAccountMovements, debugLog);
         for (const m of acctMovements) m.currency = account.currency;
         movements.push(...acctMovements);
